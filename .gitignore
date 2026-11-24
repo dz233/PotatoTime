@@ -1,0 +1,12 @@
+.venv/
+.uv-cache/
+.pyinstaller-cache/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+build/
+dist/
+.env
+.env.*
+artifacts/
