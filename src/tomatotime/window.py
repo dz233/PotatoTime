@@ -16,7 +16,9 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
 
 from .audio import EVENTS
 from .core import Config, LABELS, day_seconds, minutes, now, parse
-from .widgets import Form, Ring, icon, theme
+from .allocation import assignments, effective_before, references, task_title
+from .widgets import Form, Ring, HeightHandle, icon, theme
+from . import __version__
 
 
 def label(text, name=None):
@@ -71,7 +73,8 @@ class MainWindow(QMainWindow):
         self.notice_records = []
         self.mini = None
         self.tray = None
-        self.setWindowTitle("TomatoTime · 专注与学习日志")
+        self.selected_tasks = list(self.ctrl.task_ids)
+        self.setWindowTitle(f"TomatoTime {__version__} · 专注与学习日志")
         self.setWindowIcon(icon())
         self.resize(1180, 840)
         self.setMinimumSize(980, 680)
@@ -212,11 +215,13 @@ class MainWindow(QMainWindow):
         inner.addWidget(label("今日待办", "subheading"))
         self.tasks_table = table(("完成", "任务", "备注", "预计／当日投入"))
         self.tasks_table.setMinimumHeight(180)
-        self.tasks_table.setMaximumHeight(270)
         self.tasks_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         self.tasks_table.itemChanged.connect(self.task_checked)
         self.tasks_table.cellDoubleClicked.connect(lambda *_: self.edit_task())
         inner.addWidget(self.tasks_table)
+        handle = HeightHandle(self.tasks_table)
+        handle.resized.connect(lambda height: self.store.set("task_table_height", height))
+        inner.addWidget(handle)
         actions = QHBoxLayout()
         for text, action in (("添加", lambda: self.edit_task(True)), ("编辑", self.edit_task),
                              ("开始专注", self.focus_task), ("上移", lambda: self.move_task(-1)),
@@ -303,12 +308,16 @@ class MainWindow(QMainWindow):
         if item.column() != 0:
             return
         identity = item.data(Qt.ItemDataRole.UserRole)
-        self.store.update("tasks", identity, status="done" if item.checkState() == Qt.CheckState.Checked else "todo")
+        self.ctrl.complete_task(identity, item.checkState() == Qt.CheckState.Checked)
         self.refresh_timer.start(100)
 
     def focus_task(self):
         identity = self.task_id()
         if identity:
+            self.selected_tasks = [identity]
+            if self.ctrl.timer.active:
+                self.ctrl.associate([identity])
+            self.refresh()
             self.task_combo.setCurrentIndex(max(0, self.task_combo.findData(identity)))
         self.navigate(1)
 
@@ -369,7 +378,10 @@ class MainWindow(QMainWindow):
         grid.setVerticalSpacing(8)
         self.task_combo = QComboBox()
         self.task_combo.currentIndexChanged.connect(lambda _: self.select_next_task())
-        grid.addWidget(self.task_combo, 0, 0, 1, 3)
+        self.tasks_button = button("选择关联任务（可多选）", self.choose_tasks)
+        grid.addWidget(self.tasks_button, 0, 0, 1, 3)
+        grid.addWidget(label("当前记录任务", "muted"), 1, 0)
+        grid.addWidget(self.task_combo, 1, 1, 1, 2)
         defaults = Config(**self.store.get("timer_defaults", asdict(Config())))
         self.focus_minutes = self.duration_spin(defaults.focus / 60)
         self.short_minutes = self.duration_spin(defaults.short / 60)
@@ -385,14 +397,15 @@ class MainWindow(QMainWindow):
         self.free_mode = QCheckBox("自由计时")
         self.free_mode.setChecked(defaults.free)
         for col, (title, widget) in enumerate((("专注／分钟", self.focus_minutes), ("短休息／分钟", self.short_minutes), ("番茄数量", self.cycles))):
-            grid.addWidget(label(title, "muted"), 1, col)
-            grid.addWidget(widget, 2, col)
-        grid.addWidget(self.long_enabled, 3, 0, 1, 2)
-        grid.addWidget(self.free_mode, 3, 2)
-        grid.addWidget(label("长休息间隔／个", "muted"), 4, 0)
-        grid.addWidget(self.long_every, 5, 0)
-        grid.addWidget(label("长休息／分钟", "muted"), 4, 1, 1, 2)
-        grid.addWidget(self.long_minutes, 5, 1, 1, 2)
+            grid.addWidget(label(title, "muted"), 2, col)
+            grid.addWidget(widget, 3, col)
+        grid.addWidget(self.long_enabled, 4, 0, 1, 2)
+        grid.addWidget(self.free_mode, 4, 2)
+        grid.addWidget(label("长休息间隔／个", "muted"), 5, 0)
+        grid.addWidget(self.long_every, 6, 0)
+        grid.addWidget(label("长休息／分钟", "muted"), 5, 1, 1, 2)
+        grid.addWidget(self.long_minutes, 6, 1, 1, 2)
+        self.timing_widgets = [grid.itemAt(i).widget() for i in range(grid.count()) if grid.getItemPosition(i)[0] >= 2]
         inner.addLayout(grid)
         self.estimate_label = label("", "muted")
         inner.addWidget(self.estimate_label)
@@ -405,6 +418,7 @@ class MainWindow(QMainWindow):
             else:
                 item.toggled.connect(lambda *_: self.estimate_plan())
         box, inner = card()
+        self.record_card = box
         self.note_title = label("这一段的记录", "subheading")
         inner.addWidget(self.note_title)
         self.note_content = QPlainTextEdit()
@@ -450,11 +464,38 @@ class MainWindow(QMainWindow):
 
     def select_next_task(self):
         if self.ctrl.timer.active:
-            self.ctrl.next_task = self.task_combo.currentData()
+            self.ctrl.switch_task(self.task_combo.currentData())
+            self.statusBar().showMessage("已切换当前记录任务；原计时继续，切换前的投入保留。", 10000)
+
+    def available_tasks(self, record=None):
+        day = parse(record["start"]).astimezone().date().isoformat() if record else self.selected_day()
+        tasks = self.store.tasks(day)
+        extras = references(record) if record else self.store.task_references(self.selected_tasks)
+        for ref in extras:
+            if all(task["id"] != ref["id"] for task in tasks):
+                task = self.store.one("tasks", ref["id"])
+                if task:
+                    tasks.append(task)
+        return tasks
+
+    def choose_tasks(self):
+        form = Form("选择本次专注的任务", self)
+        selected = form.task_list(self.available_tasks(), self.selected_tasks)
+        form.form.addRow(label("多选后总时间只计一次。可切换当前任务留下分界，也可结束后右键划分；未分配时显示“未细分”。", "muted"))
+        def save():
+            self.selected_tasks = form.selected_tasks(selected)
+            if self.ctrl.timer.active:
+                self.ctrl.associate(self.selected_tasks)
+            self.refresh()
+            if not self.selected_tasks and not self.ctrl.timer.active:
+                self.task_combo.setCurrentIndex(0)
+        form.validate_with(save)
+        form.exec()
 
     def start_focus(self):
         self.flush_note()
-        self.ctrl.start(self.config(), self.task_combo.currentData())
+        chosen = self.selected_tasks or ([self.task_combo.currentData()] if self.task_combo.currentData() else [])
+        self.ctrl.start(self.config(), self.task_combo.currentData(), task_ids=chosen)
         self.navigate(1)
 
     def toggle_pause(self):
@@ -475,12 +516,19 @@ class MainWindow(QMainWindow):
         if not record:
             return
         self.note_id = identity
-        self.note_title.setText(f"{parse(record['start']).astimezone():%H:%M} · 第 {record['round']} 段记录")
+        self.record_card.show()
+        self.note_title.setText(self.record_title(record))
         for widget, key in ((self.note_content, "content"), (self.note_reflection, "reflection"), (self.note_next, "next_step")):
             widget.blockSignals(True)
             widget.setEnabled(True)
             widget.setPlainText(record[key])
             widget.blockSignals(False)
+
+    def record_title(self, record):
+        start = parse(record["start"]).astimezone()
+        span = f"{start:%H:%M}–{parse(record['end']).astimezone():%H:%M}" if record["end"] else f"{start:%H:%M} 开始 · 进行中"
+        sequence = f" · 第 {record['round']} 个番茄" if record["kind"] == "focus" else ""
+        return f"{LABELS[record['kind']]}记录{sequence}｜{span}\n{task_title(record)}"
 
     def queue_note(self):
         if self.note_id:
@@ -498,6 +546,8 @@ class MainWindow(QMainWindow):
         active = timer.active
         for item in self.config_controls:
             item.setEnabled(not active)
+        for widget in self.timing_widgets:
+            widget.setVisible(not active)
         self.start_button.setEnabled(not active)
         self.pause_button.setEnabled(active)
         self.pause_button.setText("继续" if timer.paused else "暂停")
@@ -518,7 +568,7 @@ class MainWindow(QMainWindow):
                 next_text = f"下一个：第 {timer.round + 1} 个番茄"
             self.next_label.setText(next_text)
         else:
-            self.phase_label.setText("本次计划已完成" if self.ctrl.session_id else "准备开始")
+            self.phase_label.setText("本次计时已结束" if self.ctrl.session_id else "准备开始")
             self.next_label.setText("可以调整计划，开始下一次专注。")
             self.estimate_plan()
         self.update_clock()
@@ -541,6 +591,7 @@ class MainWindow(QMainWindow):
             self.mini_title.setText(self.phase_label.text())
             self.mini_pause.setText("继续" if timer.paused else "暂停")
             self.mini_pause.setEnabled(timer.active)
+            self.mini_stop.setEnabled(timer.active)
         if self.tray:
             self.tray.setToolTip(f"TomatoTime · {self.phase_label.text()} · {int(seconds) // 60:02}:{int(seconds) % 60:02}")
 
@@ -557,40 +608,74 @@ class MainWindow(QMainWindow):
         focus = sum(r["seconds"] for r in records if r["kind"] in ("focus", "free"))
         rest = sum(r["seconds"] for r in records if r["kind"] in ("short", "long"))
         count = sum(r["kind"] == "focus" and r["status"] == "complete" for r in records)
-        form = Form("本次计划总结", self)
+        form = Form("本次专注总结", self)
         form.form.addRow(label(f"{parse(session['start']).astimezone():%H:%M}–{parse(session['end']).astimezone():%H:%M}\n完整番茄 {count} 个 · 专注 {minutes(focus)} · 休息 {minutes(rest)}"))
-        summary = form.text("本次总结（可选）", session["summary"], True)
+        activities = form.text("这段时间做了什么", session["activities"], True)
+        activities.setObjectName("sessionActivities")
+        summary = form.text("总结与感想", session["summary"], True)
         summary.setObjectName("sessionSummary")
-        last = next((r for r in reversed(records) if r["kind"] in ("focus", "free")), None)
-        content = form.text("最后一段做了什么", last["content"] if last else "", True)
-        reflection = form.text("感想／问题", last["reflection"] if last else "", True)
+        def quote_notes():
+            activities.setPlainText("\n".join(f"{parse(r['start']).astimezone():%H:%M} · {task_title(r)}：{r['content']}" for r in records if r["content"]))
+        form.form.addRow(button("引用各段学习内容", quote_notes))
+        form.form.addRow(label("以上两项涵盖这次启动的整个周期，独立保存；分段记录仍保留在各自时段。", "muted"))
         pending = QTimer(form)
         pending.setSingleShot(True)
         dirty = set()
         def save():
             pending.stop()
             self.flush_note()
+            if "activities" in dirty:
+                self.store.update("sessions", identity, activities=activities.toPlainText())
             if "summary" in dirty:
                 self.store.update("sessions", identity, summary=summary.toPlainText())
-            if last and dirty.intersection(("content", "reflection")):
-                current = self.store.one("segments", last["id"])
-                self.ctrl.save_note(last["id"], content.toPlainText() if "content" in dirty else current["content"],
-                                    reflection.toPlainText() if "reflection" in dirty else current["reflection"], current["next_step"])
-                if self.note_id == last["id"]:
-                    self.bind_note(last["id"])
             dirty.clear()
             self.refresh_timer.start(100)
         pending.timeout.connect(save)
         self.summary_savers.append(save)
-        for key, item in (("summary", summary), ("content", content), ("reflection", reflection)):
+        for key, item in (("summary", summary), ("activities", activities)):
             item.textChanged.connect(lambda k=key: (dirty.add(k), pending.start(400)))
         form.finished.connect(lambda *_: save())
-        if session["task_id"] and self.store.one("tasks", session["task_id"]):
-            form.layout_box.insertWidget(1, button(f"标记『{session['task_name']}』完成", lambda: (self.store.update("tasks", session["task_id"], status="done"), self.refresh())))
+        task_ids = list(dict.fromkeys(t["id"] for r in [session, *records] for t in references(r)))
+        feedback = label("", "muted")
+        feedback.setObjectName("completionFeedback")
+        task_box = QWidget()
+        task_rows = QVBoxLayout(task_box)
+        task_rows.setContentsMargins(0, 0, 0, 0)
+        states = []
+        for task_id in task_ids:
+            task = self.store.one("tasks", task_id)
+            if not task:
+                continue
+            row = QHBoxLayout()
+            complete = QPushButton()
+            undo = QPushButton("撤销")
+            complete.setToolTip(task["title"])
+            complete.clicked.connect(lambda checked=False, i=task_id: feedback.setText(self.ctrl.complete_task(i)))
+            undo.clicked.connect(lambda checked=False, i=task_id: feedback.setText(self.ctrl.complete_task(i, False)))
+            row.addWidget(complete, 1)
+            row.addWidget(undo)
+            task_rows.addLayout(row)
+            states.append((task_id, complete, undo))
+        def refresh_states():
+            for i, complete, undo in states:
+                task = self.store.one("tasks", i)
+                done = task and task["status"] == "done"
+                complete.setText(("✓ 已完成 · " if done else "标记完成 · ") + (task["title"][:25] if task else "任务不存在"))
+                complete.setEnabled(bool(task) and not done)
+                undo.setEnabled(bool(done))
+        refresh_states()
+        self.ctrl.changed.connect(refresh_states)
+        if states:
+            scroller = QScrollArea()
+            scroller.setWidgetResizable(True)
+            scroller.setWidget(task_box)
+            scroller.setFixedHeight(min(150, len(states) * 45 + 15))
+            form.form.addRow("任务完成情况", scroller)
+            form.form.addRow(feedback)
         form.buttons.button(form.buttons.StandardButton.Ok).setText("保存并关闭")
         form.buttons.button(form.buttons.StandardButton.Cancel).hide()
         self.dialogs.append(form)
-        if self.isVisible() or manual:
+        if self.isVisible() or manual or (self.mini and self.mini.isVisible()):
             form.show()
         if self.tray and self.store.get("notifications", True) and not manual:
             self.tray.showMessage("本次计划结束", f"专注 {minutes(focus)}，可以写下本次收获。")
@@ -604,11 +689,141 @@ class MainWindow(QMainWindow):
         tree.setHeaderLabels(("时间", "阶段", "任务／记录", "时长与状态"))
         tree.setMinimumHeight(225)
         tree.setWordWrap(True)
-        tree.setColumnWidth(0, 140)
+        tree.setColumnWidth(0, 220)
         tree.setColumnWidth(1, 85)
         tree.setColumnWidth(2, 300)
         tree.itemDoubleClicked.connect(lambda item, _: self.edit_record(item))
+        tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        tree.customContextMenuRequested.connect(lambda point, t=tree: self.timeline_menu(t, point))
         return tree
+
+    def timeline_menu(self, tree, point):
+        item = tree.itemAt(point)
+        if not item:
+            return
+        tree.setCurrentItem(item)
+        identity = item.data(0, Qt.ItemDataRole.UserRole)
+        record = self.store.one("segments", identity)
+        menu = QMenu(tree)
+        menu.addAction("编辑内容与感想", lambda: self.edit_record(identity))
+        menu.addAction("增加／移除关联任务", lambda: self.association_form(identity))
+        split = menu.addAction("按时间划分任务", lambda: self.split_form(identity))
+        time = menu.addAction("修正时间与非专注部分", lambda: self.manual_form(record))
+        undo = menu.addAction("撤销上次调整", lambda: self.guard(lambda: (self.store.undo_segment(identity), self.refresh())))
+        split.setEnabled(bool(record["end"]) and record["kind"] in ("focus", "free"))
+        time.setEnabled(bool(record["end"]))
+        undo.setEnabled(bool(record["end"]) and bool(json.loads(record["revisions"])))
+        menu.addAction("查看原始记录", lambda: self.original_form(identity))
+        menu.exec(tree.viewport().mapToGlobal(point))
+
+    def original_form(self, identity):
+        record = self.store.one("segments", identity)
+        form = Form("原始记录与调整历史", self)
+        history = json.loads(record["revisions"])
+        original = json.loads(record["original"]) if record["original"] else record
+        text = form.text("原始计时", json.dumps(original, ensure_ascii=False, indent=2), True)
+        text.setMaximumHeight(360)
+        text.setReadOnly(True)
+        form.form.addRow(label("\n".join(f"{parse(row['time']).astimezone():%m-%d %H:%M} · {row['reason']}" for row in history) or "尚未调整"))
+        form.buttons.button(form.buttons.StandardButton.Ok).setText("关闭")
+        form.buttons.button(form.buttons.StandardButton.Cancel).hide()
+        form.exec()
+
+    def association_form(self, identity):
+        record = self.store.one("segments", identity)
+        form = Form("调整这个时间段的关联任务", self)
+        selected = form.task_list(self.available_tasks(record), [t["id"] for t in references(record)])
+        form.form.addRow(label("仅调整归属，不增加计时。多任务可稍后按时间划分，未明确分配的部分单独显示。", "muted"))
+        def save():
+            ids = form.selected_tasks(selected)
+            if identity == self.ctrl.segment_id and self.ctrl.timer.active:
+                self.selected_tasks = ids
+                self.ctrl.associate(ids)
+            else:
+                self.store.associate_segment(identity, ids)
+            self.refresh()
+        form.validate_with(save)
+        form.exec()
+
+    def split_form(self, identity):
+        record = self.store.one("segments", identity)
+        if not record["end"]:
+            return
+        form = Form("按时间划分任务（原计时只计一次）", self)
+        form.resize(760, 480)
+        start, finish = parse(record["start"]), parse(record["end"])
+        form.form.addRow(label(f"原时段 {start.astimezone():%Y-%m-%d %H:%M:%S} — {finish.astimezone():%H:%M:%S}\n有效专注 {minutes(record['seconds'])}；暂停会自动扣除。请确认分界时间后保存。", "muted"))
+        allocation_table = table(("开始", "结束／分界", "任务", "有效投入"))
+        allocation_table.setMinimumHeight(190)
+        form.form.addRow(allocation_table)
+        tasks = self.available_tasks(record)
+        entries = [("未细分任务", None)] + [(t["title"], t["id"]) for t in tasks]
+        boundaries = []
+        def refresh_amounts(*_):
+            cursor = start
+            for row, (boundary, task) in enumerate(boundaries):
+                edge = boundary.dateTime().toPython().astimezone()
+                allocation_table.setItem(row, 0, QTableWidgetItem(f"{cursor.astimezone():%H:%M:%S}"))
+                amount = max(0, effective_before(json.loads(record["intervals"]), edge) - effective_before(json.loads(record["intervals"]), cursor))
+                allocation_table.setItem(row, 3, QTableWidgetItem(minutes(amount)))
+                cursor = edge
+        def add_row(edge, task_id):
+            row = len(boundaries)
+            allocation_table.setRowCount(row + 1)
+            from PySide6.QtWidgets import QDateTimeEdit
+            boundary = QDateTimeEdit(edge)
+            boundary.setDisplayFormat("yyyy-MM-dd HH:mm:ss")
+            task = QComboBox()
+            for title, value in entries:
+                task.addItem(title, value)
+            task.setCurrentIndex(max(0, task.findData(task_id)))
+            allocation_table.setCellWidget(row, 1, boundary)
+            allocation_table.setCellWidget(row, 2, task)
+            boundaries.append((boundary, task))
+            boundary.dateTimeChanged.connect(refresh_amounts)
+        configured = assignments(record)
+        if record["allocation_mode"] != "auto" and len(configured) > 1:
+            for i, a in enumerate(configured):
+                edge = parse(a["intervals"][-1]["end"]) if a["intervals"] else start
+                add_row(finish if i == len(configured) - 1 else edge, a["task_id"])
+        elif len(references(record)) >= 2:
+            add_row(start + (finish - start) / 2, references(record)[0]["id"])
+            add_row(finish, references(record)[1]["id"])
+        else:
+            add_row(finish, references(record)[0]["id"] if references(record) else None)
+        boundaries[-1][0].setReadOnly(True)
+        refresh_amounts()
+        def add_boundary():
+            last_time, last_task = boundaries[-1]
+            preceding = start if len(boundaries) == 1 else boundaries[-2][0].dateTime().toPython().astimezone()
+            last_time.setReadOnly(False)
+            last_time.setDateTime(preceding + (finish - preceding) / 2)
+            add_row(finish, None)
+            boundaries[-1][0].setReadOnly(True)
+            refresh_amounts()
+        def remove_boundary():
+            if len(boundaries) <= 1:
+                return
+            row = allocation_table.currentRow()
+            row = max(0, min(row, len(boundaries) - 2))
+            boundaries.pop(row)
+            allocation_table.removeRow(row)
+            boundaries[-1][0].setDateTime(finish)
+            boundaries[-1][0].setReadOnly(True)
+            refresh_amounts()
+        actions = QHBoxLayout()
+        actions.addWidget(button("增加分界", add_boundary))
+        actions.addWidget(button("删除选中分界", remove_boundary))
+        form.form.addRow(actions)
+        estimated = any(abs((parse(f["end"]) - parse(f["start"])).total_seconds() - f["seconds"]) > .1 for f in json.loads(record["intervals"]))
+        estimate = form.check("这条补记没有休息位置，同意按区间比例估算任务投入", False) if estimated else None
+        def save():
+            ranges = [(finish if i == len(boundaries) - 1 else boundary.dateTime().toPython().astimezone(), task.currentData())
+                      for i, (boundary, task) in enumerate(boundaries)]
+            self.store.split_segment(identity, ranges, bool(estimate and estimate.isChecked()))
+            self.refresh()
+        form.validate_with(save)
+        form.exec()
 
     def fill_timeline(self, tree, records, day=None):
         tree.clear()
@@ -620,9 +835,20 @@ class MainWindow(QMainWindow):
             if not day or (end and start.date() != end.date()):
                 display = f"{start:%m-%d} " + display
             seconds = day_seconds(json.loads(r["intervals"])).get(day, 0) if day else r["seconds"]
-            item = QTreeWidgetItem((display, LABELS[r["kind"]], r["task_name"] or "未关联任务", f"{minutes(seconds)} · {status.get(r['status'], r['status'])}"))
+            item = QTreeWidgetItem((display, LABELS[r["kind"]], task_title(r), f"{minutes(seconds)} · {status.get(r['status'], r['status'])}"))
             item.setData(0, Qt.ItemDataRole.UserRole, r["id"])
+            if end:
+                span_seconds = (end - start).total_seconds()
+                item.setToolTip(3, f"起止跨度 {minutes(span_seconds)}；有效投入 {minutes(r['seconds'])}；未计入 {minutes(max(0, span_seconds-r['seconds']))}。")
             tree.addTopLevelItem(item)
+            if r["kind"] in ("focus", "free") and (len(references(r)) > 1 or r["allocation_mode"] != "auto"):
+                for allocation in assignments(r):
+                    fragments = allocation["intervals"]
+                    amount = day_seconds(fragments).get(day, 0) if day else allocation["seconds"]
+                    span = f"{parse(fragments[0]['start']).astimezone():%H:%M:%S}–{parse(fragments[-1]['end']).astimezone():%H:%M:%S}" if fragments else "待计时"
+                    child = QTreeWidgetItem((span, "任务划分", allocation["task_name"], minutes(amount)))
+                    child.setData(0, Qt.ItemDataRole.UserRole, r["id"])
+                    item.addChild(child)
             for title, key in (("内容", "content"), ("感想", "reflection"), ("下一步", "next_step")):
                 if r[key]:
                     child = QTreeWidgetItem(("", title, r[key], ""))
@@ -632,7 +858,7 @@ class MainWindow(QMainWindow):
             item.setExpanded(True)
 
     def edit_record(self, item):
-        identity = item.data(0, Qt.ItemDataRole.UserRole)
+        identity = item if isinstance(item, int) else item.data(0, Qt.ItemDataRole.UserRole)
         record = self.store.one("segments", identity)
         form = Form("编辑时间段记录", self)
         form.form.addRow(label(f"{parse(record['start']).astimezone():%Y-%m-%d %H:%M} · {LABELS[record['kind']]}"))
@@ -642,31 +868,95 @@ class MainWindow(QMainWindow):
         tasks = [("未关联任务", None)] + [(t["title"], t["id"]) for t in self.store.tasks(parse(record["start"]).astimezone().date().isoformat())]
         if record["task_id"] and all(t[1] != record["task_id"] for t in tasks):
             tasks.append((record["task_name"] + "（历史任务）", record["task_id"]))
-        task = form.choice("关联任务", tasks, record["task_id"])
-        if record["end"]:
-            form.layout_box.insertWidget(1, button("修正时间／实际时长", lambda: (form.reject(), self.guard(lambda: self.manual_form(record)))))
-        if form.exec():
+        selected = form.task_list(self.available_tasks(record), [t["id"] for t in references(record)])
+        def save():
             self.ctrl.save_note(identity, content.toPlainText(), reflection.toPlainText(), next_step.toPlainText())
-            selected = self.store.one("tasks", task.currentData()) if task.currentData() else None
-            self.store.update("segments", identity, task_id=task.currentData(), task_name=selected["title"] if selected else "")
+            ids = form.selected_tasks(selected)
+            if ids != [t["id"] for t in references(record)]:
+                if identity == self.ctrl.segment_id and self.ctrl.timer.active:
+                    self.selected_tasks = ids
+                    self.ctrl.associate(ids)
+                else:
+                    self.store.associate_segment(identity, ids)
             if identity == self.note_id:
                 self.bind_note(identity)
             self.refresh()
+        form.validate_with(save)
+        form.exec()
 
     def manual_form(self, record=None):
         form = Form("修正时间（保留原始信息）" if record else "补记时间段", self)
-        start = form.date_time("开始", parse(record["start"]) if record else now() - timedelta(hours=1))
-        end = form.date_time("结束", parse(record["end"]) if record else now())
-        confirmed = form.check("确认实际专注时长（否则仅保留记录）", record["status"] != "unconfirmed" if record else True)
-        actual = form.number("实际专注／分钟", record["seconds"] / 60 if record else 60, decimal=True)
-        task = form.choice("关联待办", [("未关联任务", None)] + [(t["title"], t["id"]) for t in self.store.tasks(self.selected_day())], record["task_id"] if record else None)
+        date = self.day_picker.date().toPython()
+        initial_end = now().replace(year=date.year, month=date.month, day=date.day, second=0, microsecond=0)
+        start = form.date_time("开始时间", parse(record["start"]) if record else initial_end - timedelta(hours=1), seconds=True)
+        end = form.date_time("结束时间", parse(record["end"]) if record else initial_end, seconds=True)
+        start.setObjectName("manualStart")
+        end.setObjectName("manualEnd")
+        original_start_widget, original_end_widget = start.dateTime().toPython(), end.dateTime().toPython()
+        span = (parse(record["end"]) - parse(record["start"])).total_seconds() if record else 3600
+        has_break = form.check("期间包含休息／离开", bool(record and span - record["seconds"] > .5))
+        excluded = form.number("其中非专注／分钟", max(0, (span - record["seconds"]) / 60) if record else 0, decimal=True)
+        excluded.setDecimals(2)
+        only_record = form.check("只保存记录，不累计专注时长", bool(record and record["status"] == "unconfirmed"))
+        calculated = label("", "muted")
+        calculated.setObjectName("manualDuration")
+        form.form.addRow(calculated)
+        selected = form.task_list(self.available_tasks(record), [t["id"] for t in references(record)] if record else [])
         content = form.text("做了什么", record["content"] if record else "", True)
+        content.setObjectName("manualContent")
         reflection = form.text("感想／问题", record["reflection"] if record else "", True)
-        if form.exec():
-            self.store.manual(start.dateTime().toPython().astimezone(), end.dateTime().toPython().astimezone(),
-                              actual.value() * 60 if confirmed.isChecked() else None, task.currentData(),
-                              content.toPlainText(), reflection.toPlainText(), record["id"] if record else None)
+        alignment = {}
+        def dates():
+            first, last = start.dateTime().toPython().astimezone(), end.dateTime().toPython().astimezone()
+            if record and start.dateTime().toPython() == original_start_widget:
+                first = parse(record["start"])
+            if record and end.dateTime().toPython() == original_end_widget:
+                last = parse(record["end"])
+            if alignment and start.dateTime().toPython() == alignment["widget"]:
+                first = alignment["exact"]
+            return first, last
+        def update_duration(*_):
+            first, last = dates()
+            total = (last - first).total_seconds()
+            actual = max(0, total - (excluded.value() * 60 if has_break.isChecked() else 0))
+            excluded.setVisible(has_break.isChecked())
+            form.form.labelForField(excluded).setVisible(has_break.isChecked())
+            calculated.setText(f"时段共 {minutes(max(0, total))}；" + ("仅保存记录，不计时" if only_record.isChecked() else f"计入专注 {minutes(actual)}"))
+        for widget in (start, end):
+            widget.dateTimeChanged.connect(update_duration)
+        has_break.toggled.connect(update_duration)
+        only_record.toggled.connect(update_duration)
+        excluded.valueChanged.connect(update_duration)
+        update_duration()
+        align_button = button("紧接冲突记录之后开始", lambda: None)
+        align_button.setEnabled(False)
+        def align():
+            boundary = form.validation_exception.conflict_end
+            start.setDateTime(boundary)
+            alignment.update(exact=boundary, widget=start.dateTime().toPython())
+            update_duration()
+        align_button.clicked.disconnect()
+        align_button.clicked.connect(align)
+        form.validation_failed.connect(lambda error: align_button.setEnabled(hasattr(error, "conflict_end")))
+        form.form.addRow(align_button)
+        if record:
+            form.form.addRow(label("只改文字会保留原有效时间片；修改时间或扣除量会重算并清除旧任务划分，原信息可右键查看或撤销。", "muted"))
+        def save():
+            first, last = dates()
+            actual = None if only_record.isChecked() else (last - first).total_seconds() - (excluded.value() * 60 if has_break.isChecked() else 0)
+            ids = form.selected_tasks(selected)
+            unchanged = (record and first == parse(record["start"]) and last == parse(record["end"]) and
+                         ((actual is None and record["status"] == "unconfirmed") or (actual is not None and abs(actual - record["seconds"]) < .5)))
+            if unchanged:
+                self.store.revise_segment(record["id"], "补充记录内容", content=content.toPlainText(), reflection=reflection.toPlainText())
+                if ids != [t["id"] for t in references(record)]:
+                    self.store.associate_segment(record["id"], ids)
+            else:
+                self.store.manual(first, last, actual, ids[0] if len(ids) == 1 else None, content.toPlainText(), reflection.toPlainText(),
+                                  record["id"] if record else None, task_ids=ids)
             self.refresh()
+        form.validate_with(save)
+        form.exec()
 
     def create_history(self):
         layout = self.page("学习日志", "时间、内容和感想，一起留下。双击时间段可以补充记录。")
@@ -780,6 +1070,8 @@ class MainWindow(QMainWindow):
         if form.exec():
             def save():
                 config = json.loads(existing["config"]) if existing and schedule else asdict(self.config()) if schedule else {}
+                if schedule and not existing:
+                    config["_task_ids"] = list(self.selected_tasks)
                 self.ctrl.add_reminder(title.text(), due.dateTime().toPython().astimezone(), note.toPlainText(), task.currentData(),
                     repeat.currentData(), [i for i, check in enumerate(checks) if check.isChecked()],
                     "schedule" if schedule else "reminder", config, sound.currentData(), existing["id"] if existing else None)
@@ -1048,7 +1340,9 @@ class MainWindow(QMainWindow):
             controls = QHBoxLayout()
             self.mini_pause = button("暂停", self.toggle_pause)
             controls.addWidget(self.mini_pause)
-            controls.addWidget(button("记录", lambda: (self.reveal(), self.navigate(1), self.quick_note())))
+            controls.addWidget(button("记录", self.quick_record_popup))
+            self.mini_stop = button("结束本次", self.stop_focus)
+            controls.addWidget(self.mini_stop)
             layout.addLayout(controls)
             pin = QCheckBox("始终置顶")
             pin.setChecked(self.store.get("mini_pinned", True))
@@ -1066,6 +1360,44 @@ class MainWindow(QMainWindow):
         self.update_clock()
         self.mini.show()
 
+    def quick_record_popup(self):
+        if not self.ctrl.timer.active:
+            if self.ctrl.session_id:
+                self.show_session_summary(self.ctrl.session_id, True)
+            return
+        identity = self.ctrl.segment_id if self.ctrl.timer.kind in ("focus", "free") else self.ctrl.last_note
+        if not identity:
+            return
+        self.flush_note()
+        record = self.store.one("segments", identity)
+        form = Form("记录当前专注" if self.ctrl.timer.kind in ("focus", "free") else "记录刚结束的专注", self.mini)
+        form.form.addRow(label(self.record_title(record), "muted"))
+        content = form.text("做了什么", record["content"], True)
+        reflection = form.text("感想／问题", record["reflection"], True)
+        next_step = form.text("下一步（可选）", record["next_step"], True)
+        dirty = set()
+        pending = QTimer(form)
+        pending.setSingleShot(True)
+        fields = {"content": content, "reflection": reflection, "next_step": next_step}
+        def save():
+            pending.stop()
+            self.flush_note()
+            current = self.store.one("segments", identity)
+            if current and dirty:
+                data = {key: fields[key].toPlainText() if key in dirty else current[key] for key in fields}
+                self.ctrl.save_note(identity, data["content"], data["reflection"], data["next_step"])
+                if self.note_id == identity:
+                    self.bind_note(identity)
+            dirty.clear()
+        pending.timeout.connect(save)
+        for key, widget in fields.items():
+            widget.textChanged.connect(lambda k=key: (dirty.add(k), pending.start(400)))
+        form.finished.connect(lambda *_: save())
+        form.form.addRow(button("打开完整界面", lambda: (save(), self.reveal(), self.navigate(1), form.accept())))
+        self.summary_savers.append(save)
+        self.dialogs.append(form)
+        form.show()
+
     def refresh(self):
         day = self.selected_day()
         data = self.store.day(day)
@@ -1082,6 +1414,15 @@ class MainWindow(QMainWindow):
         self.tasks_table.blockSignals(True)
         previous = self.task_id()
         self.tasks_table.setRowCount(len(tasks))
+        self.tasks_table.ensurePolished()
+        self.tasks_table.horizontalHeader().ensurePolished()
+        row_height = max(32, self.tasks_table.fontMetrics().height() + 17, self.tasks_table.verticalHeader().minimumSectionSize())
+        self.tasks_table.verticalHeader().setDefaultSectionSize(row_height)
+        header_height = max(self.tasks_table.horizontalHeader().height(), self.tasks_table.horizontalHeader().sizeHint().height(), self.tasks_table.fontMetrics().height() + 24)
+        displayed_rows = min(10, max(3, len(tasks)))
+        row_pixels = sum(self.tasks_table.rowHeight(i) for i in range(min(10, len(tasks)))) + max(0, displayed_rows - len(tasks)) * row_height
+        default_height = header_height + row_pixels + self.tasks_table.frameWidth() * 2 + 16
+        self.tasks_table.setFixedHeight(self.store.get("task_table_height", default_height))
         state_names = {"todo": "", "doing": "（进行中）", "done": "", "carried": "（已带到明天）"}
         for row, t in enumerate(tasks):
             check = QTableWidgetItem("")
@@ -1090,7 +1431,7 @@ class MainWindow(QMainWindow):
             check.setData(Qt.ItemDataRole.UserRole, t["id"])
             self.tasks_table.setItem(row, 0, check)
             for col, text in enumerate((t["title"] + state_names.get(t["status"], ""), t["notes"],
-                                       f"{minutes(t['estimate']) if t['estimate'] else '未设置'}／{minutes(stats['task_seconds'].get(t['id'], 0))}"), 1):
+                                       f"{minutes(t['estimate']) if t['estimate'] else '未设置'}／{self.task_time_text(stats, t['id'])}"), 1):
                 item = QTableWidgetItem(text)
                 item.setToolTip(text)
                 self.tasks_table.setItem(row, col, item)
@@ -1098,18 +1439,30 @@ class MainWindow(QMainWindow):
                 self.tasks_table.selectRow(row)
         self.tasks_table.blockSignals(False)
         selected = self.ctrl.next_task if self.ctrl.timer.active else self.task_combo.currentData()
+        if self.ctrl.timer.active:
+            self.selected_tasks = list(self.ctrl.task_ids)
+        elif len(self.selected_tasks) == 1:
+            selected = self.selected_tasks[0]
         self.task_combo.blockSignals(True)
         self.task_combo.clear()
-        self.task_combo.addItem("未关联任务", None)
+        self.task_combo.addItem("暂不细分任务" if len(self.selected_tasks) > 1 else "未关联任务", None)
         for t in tasks:
-            if t["status"] != "carried":
+            if t["status"] != "carried" and (not self.selected_tasks or t["id"] in self.selected_tasks):
                 self.task_combo.addItem(t["title"], t["id"])
-        if selected and self.task_combo.findData(selected) < 0:
+        if selected and self.ctrl.timer.active and self.task_combo.findData(selected) < 0:
             old = self.store.one("tasks", selected)
             if old:
                 self.task_combo.addItem(old["title"] + "（其他日期）", selected)
         self.task_combo.setCurrentIndex(max(0, self.task_combo.findData(selected)))
         self.task_combo.blockSignals(False)
+        picked = [self.store.one("tasks", identity) for identity in self.selected_tasks]
+        names = "、".join(task["title"] for task in picked if task)
+        self.tasks_button.setText("关联任务：" + (names if len(names) < 32 else names[:30] + "…") if names else "选择关联任务（可多选）")
+        self.tasks_button.setToolTip(names)
+        if self.note_id:
+            record = self.store.one("segments", self.note_id)
+            if record:
+                self.note_title.setText(self.record_title(record))
         self.fill_timeline(self.timeline, self.store.segments(day), day)
         upcoming = self.store.rows("SELECT * FROM reminders WHERE enabled=1 ORDER BY due LIMIT 3")
         self.upcoming.setText("即将到来：\n" + "\n".join(f"{parse(r['due']).astimezone():%m-%d %H:%M} · {r['title']}" for r in upcoming) if upcoming else "暂无已启用的提醒或预约")
@@ -1122,6 +1475,13 @@ class MainWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+
+    @staticmethod
+    def task_time_text(stats, identity):
+        amount = stats["task_seconds"].get(identity, 0)
+        if identity in stats["unresolved"]:
+            return "未细分" if amount < .001 else minutes(amount) + "＋未细分"
+        return minutes(amount)
 
     def closeEvent(self, event):
         self.flush_note()

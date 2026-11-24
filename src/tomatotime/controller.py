@@ -10,6 +10,7 @@ from PySide6.QtCore import QObject, Signal
 
 from .core import Clock, Config, Timer, next_due, parse, stamp
 from .storage import Store
+from .allocation import references
 
 
 class Controller(QObject):
@@ -26,6 +27,7 @@ class Controller(QObject):
         self.store, self.clock = store, clock or Clock()
         self.timer = Timer(self.clock)
         self.session_id = self.segment_id = self.next_task = self.last_note = None
+        self.task_ids = []
         self.last_saved = self.clock.monotonic()
         self.presented: set[int] = set()
         self.startup = True
@@ -36,17 +38,20 @@ class Controller(QObject):
                 self.timer.restore(state["timer"])
                 self.session_id, self.segment_id = state["session"], state["segment"]
                 self.next_task, self.last_note = state.get("next_task"), state.get("last_note")
+                self.task_ids = state.get("task_ids", [self.next_task] if self.next_task else [])
                 self.recovery = True
 
-    def start(self, config: Config, task_id: int | None = None, automatic=False):
+    def start(self, config: Config, task_id: int | None = None, automatic=False, task_ids=None):
         if self.timer.active:
             raise ValueError("已有计划正在进行，请先结束")
         config.validate()
         task = self.store.one("tasks", task_id) if task_id else None
-        self.next_task = task_id if task and not task["deleted"] else None
+        self.task_ids = list(dict.fromkeys(task_ids if task_ids is not None else [task_id] if task_id else []))
+        tasks = self.store.task_references(self.task_ids)
+        self.next_task = task_id if task_id in self.task_ids else self.task_ids[0] if len(self.task_ids) == 1 else None
         self.timer.start(config)
         self.session_id = self.store.add("sessions", task_id=self.next_task, task_name=task["title"] if task else "",
-                                         start=stamp(self.clock.now()), status="running", config=json.dumps(asdict(config)))
+                                         start=stamp(self.clock.now()), status="running", config=json.dumps(asdict(config)), tasks=json.dumps(tasks, ensure_ascii=False))
         self.store.set("timer_defaults", asdict(config))
         self.new_segment()
         self.save()
@@ -56,10 +61,13 @@ class Controller(QObject):
             self.sound.emit("auto_start", "default")
 
     def new_segment(self):
+        tasks = self.store.task_references(self.task_ids)
         task = self.store.one("tasks", self.next_task) if self.next_task else None
         self.segment_id = self.store.add("segments", session_id=self.session_id, task_id=self.next_task,
-                                         task_name=task["title"] if task else "", round=self.timer.round,
-                                         kind=self.timer.kind, start=stamp(self.clock.now()), status="running")
+                                         task_name="、".join(t["name"] for t in tasks), tasks=json.dumps(tasks, ensure_ascii=False), round=self.timer.round,
+                                         kind=self.timer.kind, start=stamp(self.clock.now()), status="running",
+                                         allocation_mode="tracked" if self.next_task and len(tasks) > 1 else "auto",
+                                         allocations=json.dumps([{"task_id": self.next_task, "task_name": task["title"], "from": 0, "to": None}] if self.next_task and len(tasks) > 1 else []))
         if self.timer.kind in ("focus", "free"):
             self.store.save_day(self.clock.now().date().isoformat(), closed=0)
             if task and task["status"] == "todo":
@@ -70,16 +78,77 @@ class Controller(QObject):
             self.store.update("segments", self.segment_id, seconds=self.timer.elapsed,
                               intervals=json.dumps(self.timer.fragments()), status="paused" if self.timer.paused else "running")
         self.store.set("active_state", {"timer": self.timer.snapshot(), "session": self.session_id,
-                                        "segment": self.segment_id, "next_task": self.next_task, "last_note": self.last_note})
+                                        "segment": self.segment_id, "next_task": self.next_task, "last_note": self.last_note, "task_ids": self.task_ids})
         self.last_saved = self.clock.monotonic()
 
     def finish_segment(self, status="complete"):
         fragments = self.timer.fragments()
         end = fragments[-1]["end"] if fragments else stamp(self.clock.now())
         self.store.update("segments", self.segment_id, seconds=self.timer.elapsed, intervals=json.dumps(fragments), end=end, status=status)
+        record = self.store.one("segments", self.segment_id)
+        allocations = json.loads(record["allocations"])
+        if allocations and allocations[-1]["to"] is None:
+            allocations[-1]["to"] = self.timer.elapsed
+            self.store.update("segments", self.segment_id, allocations=json.dumps(allocations, ensure_ascii=False))
         if self.timer.kind in ("focus", "free"):
             self.last_note = self.segment_id
             self.note_ready.emit(self.segment_id)
+
+    def switch_task(self, task_id, force=False):
+        if self.timer.active:
+            self.tick()
+        if task_id:
+            self.store.task_references([task_id])
+            if task_id not in self.task_ids:
+                self.task_ids.append(task_id)
+        if self.timer.active and self.timer.kind in ("focus", "free") and (force or task_id != self.next_task):
+            record = self.store.one("segments", self.segment_id)
+            tasks = references(record)
+            if task_id and all(task["id"] != task_id for task in tasks):
+                tasks.extend(self.store.task_references([task_id]))
+                self.store.update("segments", self.segment_id, tasks=json.dumps(tasks, ensure_ascii=False), task_name="、".join(t["name"] for t in tasks))
+            allocations = json.loads(record["allocations"])
+            if record["allocation_mode"] == "auto":
+                old = references(record)
+                allocations = [{"task_id": old[0]["id"] if len(old) == 1 else None,
+                                "task_name": old[0]["name"] if len(old) == 1 else "未细分任务", "from": 0, "to": self.timer.elapsed}]
+            elif allocations and allocations[-1]["to"] is None:
+                allocations[-1]["to"] = self.timer.elapsed
+            task = self.store.one("tasks", task_id) if task_id else None
+            allocations.append({"task_id": task_id, "task_name": task["title"] if task else "未细分任务", "from": self.timer.elapsed, "to": None})
+            self.store.update("segments", self.segment_id, allocations=json.dumps(allocations, ensure_ascii=False), allocation_mode="tracked")
+        self.next_task = task_id
+        if task_id:
+            task = self.store.one("tasks", task_id)
+            if task["status"] == "todo":
+                self.store.update("tasks", task_id, status="doing")
+        self.save()
+        self.changed.emit()
+        self.phase_changed.emit()
+
+    def associate(self, ids):
+        self.store.task_references(ids)
+        if self.timer.active:
+            self.tick()
+            record = self.store.one("segments", self.segment_id)
+            wanted = self.next_task if self.next_task in ids else ids[0] if len(ids) == 1 else None
+            self.switch_task(wanted, force=record["allocation_mode"] == "auto")
+            allocations = json.loads(self.store.one("segments", self.segment_id)["allocations"])
+            past = [a["task_id"] for a in allocations if a["task_id"] and a["to"] is not None and a["to"] > a["from"]]
+            tasks = self.store.task_references(list(dict.fromkeys([*ids, *past])))
+            self.store.update("segments", self.segment_id, tasks=json.dumps(tasks, ensure_ascii=False), task_name="、".join(t["name"] for t in tasks),
+                              task_id=tasks[0]["id"] if len(tasks) == 1 else None)
+        self.task_ids = list(dict.fromkeys(ids))
+        self.save()
+        self.changed.emit()
+
+    def complete_task(self, identity, completed=True):
+        changed = self.store.complete_task(identity, completed)
+        task = self.store.one("tasks", identity)
+        message = ("已标记完成：" if changed else "原本已完成：") + task["title"] if completed else "已取消完成标记：" + task["title"]
+        self.message.emit(message)
+        self.changed.emit()
+        return message
 
     def advance(self, skipped=False):
         self.finish_segment("skipped" if skipped else "complete")
@@ -107,6 +176,7 @@ class Controller(QObject):
             self.message.emit("检测到睡眠、时钟变化或较长中断，已暂停；中断时间未计入专注。确认后可继续。")
         if self.timer.active and self.clock.monotonic() - self.last_saved >= 5:
             self.save()
+            self.changed.emit()
         self.poll_reminders()
 
     def pause(self):
@@ -192,7 +262,9 @@ class Controller(QObject):
                     state = "skipped"
                     if not missed and not self.timer.active:
                         try:
-                            self.start(Config(**json.loads(reminder["config"])), reminder["task_id"], automatic=True)
+                            configured = json.loads(reminder["config"])
+                            task_ids = configured.pop("_task_ids", None)
+                            self.start(Config(**configured), reminder["task_id"], automatic=True, task_ids=task_ids)
                             state = "started"
                         except ValueError as error:
                             self.message.emit(str(error))

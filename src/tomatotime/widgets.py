@@ -3,10 +3,12 @@
 from datetime import timedelta
 import math
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QSpinBox, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import QListWidget, QListWidgetItem
+from PySide6.QtWidgets import QApplication, QScrollArea
 
 from .core import now
 
@@ -91,20 +93,69 @@ class Ring(QWidget):
 
 
 class Form(QDialog):
+    validation_failed = Signal(object)
     def __init__(self, title, parent=None):
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(460, 420)
+        self.resize(530, 560)
+        self.setMinimumSize(430, 350)
+        if QApplication.primaryScreen():
+            self.setMaximumHeight(max(400, QApplication.primaryScreen().availableGeometry().height() - 60))
         self.layout_box = QVBoxLayout(self)
-        self.form = QFormLayout()
+        form_widget = QWidget()
+        self.form = QFormLayout(form_widget)
         self.form.setSpacing(12)
-        self.layout_box.addLayout(self.form)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(form_widget)
+        self.layout_box.addWidget(scroll, 1)
         self.buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
         self.buttons.button(QDialogButtonBox.StandardButton.Ok).setText("保存")
         self.buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
         self.layout_box.addWidget(self.buttons)
+        self.error_label = QLabel()
+        self.error_label.setWordWrap(True)
+        self.error_label.setMaximumHeight(110)
+        self.error_label.setStyleSheet("color:#c74646")
+        self.error_label.setObjectName("validationError")
+        self.error_label.hide()
+        self.layout_box.insertWidget(self.layout_box.count() - 1, self.error_label)
+
+    def validate_with(self, action):
+        self.buttons.accepted.disconnect(self.accept)
+        def submit():
+            try:
+                action()
+            except (ValueError, OSError) as error:
+                self.validation_exception = error
+                self.error_label.setText(str(error))
+                self.error_label.show()
+                self.validation_failed.emit(error)
+                self.adjustSize()
+            else:
+                self.accept()
+        self.buttons.accepted.connect(submit)
+        return submit
+
+    def task_list(self, tasks, selected=(), label="关联任务（可多选）"):
+        widget = QListWidget()
+        widget.setMaximumHeight(170)
+        widget.setMinimumHeight(95)
+        for task in tasks:
+            item = QListWidgetItem(task["title"])
+            item.setData(Qt.ItemDataRole.UserRole, task["id"])
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(Qt.CheckState.Checked if task["id"] in selected else Qt.CheckState.Unchecked)
+            widget.addItem(item)
+        self.form.addRow(label, widget)
+        return widget
+
+    @staticmethod
+    def selected_tasks(widget):
+        return [widget.item(i).data(Qt.ItemDataRole.UserRole) for i in range(widget.count())
+                if widget.item(i).checkState() == Qt.CheckState.Checked]
 
     def text(self, label, value="", multiline=False):
         widget = QPlainTextEdit(value) if multiline else QLineEdit(value)
@@ -131,10 +182,11 @@ class Form(QDialog):
         self.form.addRow(label, widget)
         return widget
 
-    def date_time(self, label, value=None):
-        widget = QDateTimeEdit((value or now() + timedelta(minutes=10)).replace(second=0, microsecond=0))
+    def date_time(self, label, value=None, seconds=False):
+        initial = value or now() + timedelta(minutes=10)
+        widget = QDateTimeEdit(initial if seconds else initial.replace(second=0, microsecond=0))
         widget.setCalendarPopup(True)
-        widget.setDisplayFormat("yyyy-MM-dd HH:mm")
+        widget.setDisplayFormat("yyyy-MM-dd HH:mm:ss" if seconds else "yyyy-MM-dd HH:mm")
         self.form.addRow(label, widget)
         return widget
 
@@ -156,3 +208,29 @@ class Form(QDialog):
             checks.append(check)
         self.form.addRow("每周星期", box)
         return checks
+
+
+class HeightHandle(QWidget):
+    resized = Signal(int)
+
+    def __init__(self, target):
+        super().__init__()
+        self.target = target
+        self.setFixedHeight(12)
+        self.setCursor(Qt.CursorShape.SizeVerCursor)
+        self.setToolTip("上下拖动调整待办列表高度")
+
+    def mousePressEvent(self, event):
+        self.origin = event.globalPosition().y()
+        self.initial = self.target.height()
+
+    def mouseMoveEvent(self, event):
+        if event.buttons() & Qt.MouseButton.LeftButton:
+            height = max(140, min(850, self.initial + int(event.globalPosition().y() - self.origin)))
+            self.target.setFixedHeight(height)
+            self.resized.emit(height)
+
+    def paintEvent(self, event):
+        painter = QPainter(self)
+        painter.setPen(QPen(QColor("#91abc8"), 2))
+        painter.drawLine(self.width() // 2 - 20, 6, self.width() // 2 + 20, 6)
