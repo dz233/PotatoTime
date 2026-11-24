@@ -1,14 +1,13 @@
 """内置柔和音效、自定义音频和同时事件的声音合并。"""
 
 import hashlib
-import math
 from pathlib import Path
 import shutil
-import struct
-import wave
 
 from PySide6.QtCore import QObject, QTimer, QUrl, Signal
 from PySide6.QtMultimedia import QAudioOutput, QMediaPlayer
+
+from .synthesis import DEFAULT_PRESETS, PRESETS, synthesize
 
 
 EVENTS = {"auto_start": "自动开始", "break_start": "短休息开始", "long_start": "长休息开始",
@@ -30,19 +29,13 @@ class Audio(QObject):
         self.flush_timer = QTimer(self)
         self.flush_timer.setSingleShot(True)
         self.flush_timer.timeout.connect(self.flush)
-        for index, event in enumerate(EVENTS):
-            path = self.store.audio_dir / f"builtin-{event}.wav"
-            if not path.exists():
-                samples = []
-                for note in range(2 if event != "complete" else 3):
-                    frequency = (520 + index * 70) * (1 + note * .16)
-                    for i in range(8820):
-                        envelope = math.sin(math.pi * i / 8820) ** 2
-                        samples.append(int(6500 * envelope * math.sin(2 * math.pi * frequency * i / 44100)))
-                    samples.extend([0] * 2646)
-                with wave.open(str(path), "wb") as wav:
-                    wav.setparams((1, 2, 44100, 0, "NONE", "not compressed"))
-                    wav.writeframes(struct.pack(f"<{len(samples)}h", *samples))
+        bank = {f"builtin-{event}.wav": synthesize(preset) for event, preset in DEFAULT_PRESETS.items()}
+        bank.update({f"builtin-preset-{preset}.wav": synthesize(preset) for preset in PRESETS})
+        for name, content in bank.items():
+            path = self.store.audio_dir / name
+            # 内置文件是派生资源；更新旧缓存，导入的自定义音频不受影响。
+            if not path.exists() or path.read_bytes() != content:
+                path.write_bytes(content)
 
     def import_file(self, source: str) -> str:
         path = Path(source)
@@ -74,6 +67,8 @@ class Audio(QObject):
             return
         if name == "default":
             name = f"builtin-{event}.wav"
+        elif name.startswith("preset:"):
+            name = f"builtin-preset-{name.removeprefix('preset:')}.wav"
         path = self.store.audio_dir / Path(name).name
         if not path.exists():
             self.error.emit("自定义音效不存在，请重新选择")

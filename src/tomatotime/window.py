@@ -15,9 +15,10 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
     QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget, QLineEdit)
 
 from .audio import EVENTS
+from .synthesis import DEFAULT_PRESETS, PRESETS
 from .core import Config, LABELS, day_seconds, minutes, now, parse
 from .allocation import assignments, effective_before, references, task_title
-from .widgets import Form, Ring, HeightHandle, icon, theme
+from .widgets import DesktopNotice, Form, Ring, HeightHandle, icon, theme
 from . import __version__
 
 
@@ -70,6 +71,7 @@ class MainWindow(QMainWindow):
         self.day_pending = None
         self.loaded_day = None
         self.notice_dialog = None
+        self.notification_popup = None
         self.notice_records = []
         self.mini = None
         self.tray = None
@@ -572,10 +574,25 @@ class MainWindow(QMainWindow):
             self.next_label.setText("可以调整计划，开始下一次专注。")
             self.estimate_plan()
         self.update_clock()
-        if (self.tray and active and self.store.get("notifications", True)
+        if (active and self.store.get("notifications", True)
                 and getattr(self, "notified_segment", None) != self.ctrl.segment_id):
-            self.tray.showMessage(LABELS[timer.kind] + "开始", self.next_label.text() + ("。可以补充刚才的学习记录。" if resting else ""))
+            self.show_notification(LABELS[timer.kind] + "开始", self.next_label.text() + ("。可以补充刚才的学习记录。" if resting else ""))
         self.notified_segment = self.ctrl.segment_id
+
+    def show_notification(self, title, body):
+        if self.notification_popup is None:
+            self.notification_popup = DesktopNotice(self)
+            self.notification_popup.opened.connect(self.open_notification)
+        self.notification_popup.present(title, body)
+
+    def open_notification(self):
+        self.reveal()
+        self.navigate(1)
+        if not self.ctrl.timer.active:
+            summary = next((dialog for dialog in reversed(self.dialogs) if dialog.windowTitle() == "本次专注总结"), None)
+            if summary:
+                summary.show()
+                summary.raise_()
 
     def update_clock(self):
         timer = self.ctrl.timer
@@ -677,8 +694,8 @@ class MainWindow(QMainWindow):
         self.dialogs.append(form)
         if self.isVisible() or manual or (self.mini and self.mini.isVisible()):
             form.show()
-        if self.tray and self.store.get("notifications", True) and not manual:
-            self.tray.showMessage("本次计划结束", f"专注 {minutes(focus)}，可以写下本次收获。")
+        if self.store.get("notifications", True) and not manual:
+            self.show_notification("本次计划结束", f"专注 {minutes(focus)}，可以写下本次收获。")
 
     def flush_summaries(self):
         for save in self.summary_savers:
@@ -1201,7 +1218,7 @@ class MainWindow(QMainWindow):
         self.close_to_tray.setChecked(self.store.get("close_to_tray", True))
         self.close_to_tray.toggled.connect(lambda value: self.store.set("close_to_tray", value))
         inner.addWidget(self.close_to_tray)
-        notifications = QCheckBox("阶段切换和周期结束时显示系统通知")
+        notifications = QCheckBox("阶段切换和周期结束时显示桌面小弹窗")
         notifications.setChecked(self.store.get("notifications", True))
         notifications.toggled.connect(lambda value: self.store.set("notifications", value))
         inner.addWidget(notifications)
@@ -1223,17 +1240,19 @@ class MainWindow(QMainWindow):
         controls.addWidget(volume)
         controls.addStretch()
         inner.addLayout(controls)
-        inner.addWidget(label("系统通知的声音由 Windows 控制；应用提示音由这里的静音、音量和各项音效控制。", "muted"))
+        inner.addWidget(label("桌面小弹窗不触发 Windows 提示音，提醒声音统一由这里控制。", "muted"))
         self.sound_combos = {}
         for event, title in EVENTS.items():
             row = QHBoxLayout()
             row.addWidget(label(title))
             combo = QComboBox()
             combo.setMinimumWidth(250)
-            combo.addItem("内置提示音", "default")
+            combo.addItem("默认 · " + PRESETS[DEFAULT_PRESETS[event]][0], "default")
+            for preset, (name, _) in PRESETS.items():
+                combo.addItem(name, "preset:" + preset)
             combo.addItem("静音", "silent")
             value = self.store.get("sound:" + event, "default")
-            if value not in ("default", "silent"):
+            if combo.findData(value) < 0:
                 combo.addItem("自定义 · " + value, value)
             combo.setCurrentIndex(max(0, combo.findData(value)))
             combo.currentIndexChanged.connect(lambda _, e=event, c=combo: self.store.set("sound:" + e, c.currentData()))
@@ -1507,7 +1526,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             self.hide()
             if not self.store.get("tray_explained", False):
-                self.tray.showMessage("已收至托盘", "计时和提醒继续。通过托盘菜单可以退出。")
+                self.show_notification("已收至托盘", "计时和提醒继续。通过托盘菜单可以退出。")
                 self.store.set("tray_explained", True)
             return
         if not self.quitting:
@@ -1527,6 +1546,8 @@ class MainWindow(QMainWindow):
             if self.mini:
                 self.store.set("mini_geometry", bytes(self.mini.saveGeometry()).hex())
         self.quitting = True
+        if self.notification_popup:
+            self.notification_popup.dismiss()
         self.audio.close()
         if self.tray:
             self.tray.hide()

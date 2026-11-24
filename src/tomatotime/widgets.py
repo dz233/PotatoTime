@@ -3,12 +3,12 @@
 from datetime import timedelta
 import math
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, QTimer
 from PySide6.QtGui import QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDateTimeEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
                               QFormLayout, QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QSpinBox, QVBoxLayout, QWidget)
 from PySide6.QtWidgets import QListWidget, QListWidgetItem
-from PySide6.QtWidgets import QApplication, QScrollArea
+from PySide6.QtWidgets import QApplication, QScrollArea, QPushButton
 
 from .core import now
 
@@ -60,6 +60,59 @@ def icon() -> QIcon:
     painter.drawLine(32, 33, 40, 37)
     painter.end()
     return QIcon(pixmap)
+
+
+class DesktopNotice(QDialog):
+    """不发系统通知、不抢输入焦点的桌面小弹窗。"""
+
+    opened = Signal()
+
+    def __init__(self, parent):
+        super().__init__(parent, Qt.WindowType.Window | Qt.WindowType.FramelessWindowHint
+                         | Qt.WindowType.WindowStaysOnTopHint | Qt.WindowType.WindowDoesNotAcceptFocus)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setWindowTitle("TomatoTime · 提醒")
+        self.setWindowIcon(icon())
+        self.setFixedWidth(360)
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 18, 20, 18)
+        self.title = QLabel()
+        self.title.setObjectName("subheading")
+        self.title.setTextFormat(Qt.TextFormat.PlainText)
+        self.title.setWordWrap(True)
+        self.body = QLabel()
+        self.body.setTextFormat(Qt.TextFormat.PlainText)
+        self.body.setWordWrap(True)
+        layout.addWidget(self.title)
+        layout.addWidget(self.body)
+        actions = QHBoxLayout()
+        self.open_button = QPushButton("打开应用")
+        self.open_button.setObjectName("primary")
+        close = QPushButton("关闭")
+        for item in (self.open_button, close):
+            item.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+            actions.addWidget(item)
+        layout.addLayout(actions)
+        self.open_button.clicked.connect(lambda: (self.dismiss(), self.opened.emit()))
+        close.clicked.connect(self.dismiss)
+        self.timer = QTimer(self)
+        self.timer.setSingleShot(True)
+        self.timer.timeout.connect(self.dismiss)
+
+    def present(self, title, body):
+        self.title.setText(title)
+        self.body.setText(body)
+        self.adjustSize()
+        screen = self.parentWidget().screen() or QApplication.primaryScreen()
+        if screen:
+            area = screen.availableGeometry()
+            self.move(area.right() - self.width() - 20, area.bottom() - self.height() - 20)
+        self.show()
+        self.timer.start(12000)
+
+    def dismiss(self):
+        self.timer.stop()
+        self.hide()
 
 
 class Ring(QWidget):
