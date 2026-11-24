@@ -1,6 +1,6 @@
 # TomatoTime
 
-Windows 本地番茄钟与学习日志，当前改进版为 v0.2.0。更新内容见 [CHANGELOG.md](CHANGELOG.md)，验证与交付进度见 [PROGRESS.md](PROGRESS.md)。
+Windows 本地番茄钟与学习日志，当前改进版为 v0.2.1。更新内容见 [CHANGELOG.md](CHANGELOG.md)，验证与交付进度见 [PROGRESS.md](PROGRESS.md)。
 
 采用 Python 3.13、uv、PySide6 和 SQLite。完整需求见 [原方案](PLAN.md)，Python 架构与实施阶段见 [Python 方案](PYTHON_PLAN.md)。
 
@@ -8,7 +8,7 @@ Windows 本地番茄钟与学习日志，当前改进版为 v0.2.0。更新内�
 
 ## 启动与使用
 
-打包版双击 `dist/v0.2.0/TomatoTime/TomatoTime.exe`。分发时保留完整 `TomatoTime` 文件夹，或解压 `dist/v0.2.0/TomatoTime-Windows-x64-v0.2.0.zip` 后运行。打包版不需要安装 Python。
+打包版双击 `dist/v0.2.1/TomatoTime/TomatoTime.exe`。分发时保留完整 `TomatoTime` 文件夹，或解压 `dist/v0.2.1/TomatoTime-Windows-x64-v0.2.1.zip` 后运行。打包版不需要安装 Python。
 
 升级前从旧程序的托盘菜单「退出」，然后运行新版；只关闭旧窗口会继续留在托盘，单实例机制会唤醒旧程序。新版首次打开旧数据时，会在数据目录保存 `before-v0.2-*.sqlite3`，再升级记录结构，保留原任务、时间片和笔记。旧版 ZIP 已保存于 `releases/v0.1.0`。
 
@@ -39,6 +39,8 @@ uv run python run_app.py
 「新建提醒」设置完整日期时间、标题与备注，支持重复和稍后提醒。到点弹窗，即使主窗口收至托盘也有效。事项提醒不会自动启动计时，预约自动开始单独设置。
 
 关闭主窗口默认收至托盘，退出使用托盘右键菜单；设置中可修改关闭行为。主窗口和迷你窗口分别支持置顶。音效按事件配置，导入 MP3／WAV／OGG 后复制到数据目录。
+
+阶段系统通知在主窗口打开、最小化和收至托盘时都会发送，设置中的通知开关继续生效。系统通知声音由 Windows 控制，应用提示音由全部静音、音量及各事件音效独立控制。如果只听到系统声音，请检查各项是否选为「静音」，或点击「恢复内置音效」统一恢复内置音、取消全部静音并设为 60% 音量，再用「试听」检查。升级保留原音效设置。
 
 支持自由计时、手动补记与时间修正、待办迁移、跨午夜统计、未完成计划恢复、JSON 完整备份和恢复。无法确认的混合活动仅保存记录；已确认专注的补记不能与已有专注重叠。
 
@@ -81,9 +83,12 @@ uv run python -m unittest discover -s tests -v
 uv run python scripts/verify_app.py
 uv run python scripts/verify_app.py --native
 uv run python scripts/verify_improvements.py --native
+uv run python scripts/verify_notifications.py --native
 ```
 
 界面验证使用临时数据库，包含暂停、记录绑定、主窗口隐藏时提醒、稍后提醒、迷你窗口和置顶。`--native` 会短暂显示测试窗口，以零音量验证 WAV 解码；完成后关闭。截图位于 `artifacts/app`。
+
+阶段提醒回归检查窗口打开／隐藏／最小化时的短休息、长休息、下一轮专注和全部完成通知请求；系统托盘用测试替身避免发送测试通知。Windows 原生音频以零音量验证 WAV 播放至结束，同时检查单项静音和恢复内置音效。
 
 打包阶段：
 

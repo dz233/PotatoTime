@@ -572,7 +572,7 @@ class MainWindow(QMainWindow):
             self.next_label.setText("可以调整计划，开始下一次专注。")
             self.estimate_plan()
         self.update_clock()
-        if (self.tray and active and not self.isVisible() and self.store.get("notifications", True)
+        if (self.tray and active and self.store.get("notifications", True)
                 and getattr(self, "notified_segment", None) != self.ctrl.segment_id):
             self.tray.showMessage(LABELS[timer.kind] + "开始", self.next_label.text() + ("。可以补充刚才的学习记录。" if resting else ""))
         self.notified_segment = self.ctrl.segment_id
@@ -1223,6 +1223,7 @@ class MainWindow(QMainWindow):
         controls.addWidget(volume)
         controls.addStretch()
         inner.addLayout(controls)
+        inner.addWidget(label("系统通知的声音由 Windows 控制；应用提示音由这里的静音、音量和各项音效控制。", "muted"))
         self.sound_combos = {}
         for event, title in EVENTS.items():
             row = QHBoxLayout()
@@ -1241,6 +1242,18 @@ class MainWindow(QMainWindow):
             row.addWidget(button("选择文件", lambda checked=False, e=event: self.import_sound(e)))
             row.addWidget(button("试听", lambda checked=False, e=event: self.audio.play(e)))
             inner.addLayout(row)
+        def restore_sounds():
+            muted.setChecked(False)
+            volume.setValue(60)
+            self.store.set("muted", False)
+            self.store.set("volume", 60)
+            for event, combo in self.sound_combos.items():
+                combo.setCurrentIndex(combo.findData("default"))
+                self.store.set("sound:" + event, "default")
+            self.statusBar().showMessage("已恢复全部内置提示音，音量为 60%。可以点击各项“试听”检查声音。", 15000)
+        restore = button("恢复内置音效", restore_sounds)
+        restore.setObjectName("restoreBuiltinSounds")
+        inner.addWidget(restore)
         layout.addWidget(box)
         box, inner = card()
         inner.addWidget(label("日志与备份", "subheading"))

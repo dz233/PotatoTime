@@ -1,6 +1,6 @@
 # 实施进度
 
-更新时间：2026-11-24。当前为 v0.2.0 改进版，Python 3.13 + uv 路线，原 Tauri 方案保留。
+更新时间：2026-11-24。当前为 v0.2.1 提醒修复版，Python 3.13 + uv 路线，原 Tauri 方案保留。
 
 | 阶段 | 状态 | 实施内容 |
 | --- | --- | --- |
@@ -29,13 +29,16 @@
 
 ## 交付
 
-- 新版运行：`dist/v0.2.0/TomatoTime/TomatoTime.exe`，完整保留同目录依赖。
-- 新版分发：`dist/v0.2.0/TomatoTime-Windows-x64-v0.2.0.zip`，约 55.7 MiB。
+- 新版运行：`dist/v0.2.1/TomatoTime/TomatoTime.exe`，完整保留同目录依赖。
+- 新版分发：`dist/v0.2.1/TomatoTime-Windows-x64-v0.2.1.zip`。
+- v0.2.0 保留在 `dist/v0.2.0`，Git 标签 `v0.2.0` 对应提交 `8a3890d`。
 - 原版：`dist/TomatoTime/TomatoTime.exe`，ZIP 另存 `releases/v0.1.0`。
 - 源码启动：`uv run python run_app.py`。
 - 使用说明：README.md。
 
 ## 验证范围
+
+v0.2.1 修正阶段通知的窗口可见性限制，增加音效恢复入口。40 项业务测试再次通过；原生回归检查短休息／长休息／下一轮／结束的通知请求、去重与开关，以及零音量 WAV 播放至结束。没有修改真实学习记录或正在运行的旧版本。
 
 验证在当前 Windows 11 本机进行，测试数据均使用独立目录。未做另一台干净电脑验收或真实长时间睡眠循环；睡眠／跨日规则有业务测试和恢复实现。音频实机测试使用 WAV，MP3／OGG 由 Qt 解码，失败时显示提示。
 
